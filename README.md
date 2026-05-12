@@ -38,7 +38,7 @@ src/mcp_mt5_strategie/
 Requires Windows + MetaTrader 5 installed.
 
 ```bash
-git clone https://github.com/florentmorel/mcp-mt5-strategie-server.git
+git clone https://github.com/florent427/mcp-mt5-strategie-server.git
 cd mcp-mt5-strategie-server
 pip install -e .
 ```

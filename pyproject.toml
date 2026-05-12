@@ -41,8 +41,8 @@ dev = [
 mt5-strategie-mcp = "mcp_mt5_strategie.server:main"
 
 [project.urls]
-Homepage = "https://github.com/florentmorel/mcp-mt5-strategie-server"
-Issues = "https://github.com/florentmorel/mcp-mt5-strategie-server/issues"
+Homepage = "https://github.com/florent427/mcp-mt5-strategie-server"
+Issues = "https://github.com/florent427/mcp-mt5-strategie-server/issues"
 
 [build-system]
 requires = ["hatchling"]
