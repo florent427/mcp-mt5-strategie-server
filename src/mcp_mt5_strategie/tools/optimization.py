@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 
 from ..config import config
 from ..parsers.opt_xml import parse_optimization_report
-from .backtest import BacktestConfig, MODEL_CODES, _find_latest_report
+from .backtest import BacktestConfig, MODEL_CODES, _find_latest_report, _stop_running_terminals
 
 OptCriterion = Literal[
     "balance_max",
@@ -106,6 +106,14 @@ def run_optimization(cfg: OptimizationConfig) -> dict:
     expected = reports_dir / f"{cfg.expert_name}_opt.xml"
     if expected.exists():
         expected.unlink()
+
+    # Stop the bridge-terminal MT5 Python API may have launched (see backtest.py)
+    try:
+        import MetaTrader5 as mt5  # type: ignore
+        mt5.shutdown()
+    except Exception:
+        pass
+    _stop_running_terminals(config.terminal_path)
 
     # See note in backtest.py — /portable would point MT5 at the install dir,
     # not the AppData instance where the EA lives.

@@ -15,10 +15,43 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, Optional
 
+import psutil
 from pydantic import BaseModel, Field
 
 from ..config import config
 from ..parsers.report_xml import parse_backtest_report
+
+
+def _stop_running_terminals(terminal_exe: Path, wait_sec: float = 10.0) -> int:
+    """Stop any terminal64.exe processes that match our configured path.
+
+    MT5 holds a data-folder lock; if a terminal was already launched (e.g. by
+    a prior mt5.initialize() Python call to bridge the API), launching a new
+    /config: tester instance silently fails — the second terminal starts,
+    authenticates, then sits idle without running the test.
+
+    Returns the number of processes killed.
+    """
+    target = str(terminal_exe).lower()
+    killed: list[psutil.Process] = []
+    for p in psutil.process_iter(["pid", "name", "exe"]):
+        try:
+            if (p.info.get("name") or "").lower() != "terminal64.exe":
+                continue
+            exe = (p.info.get("exe") or "").lower()
+            if exe == target:
+                p.terminate()
+                killed.append(p)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    if killed:
+        gone, alive = psutil.wait_procs(killed, timeout=wait_sec)
+        for p in alive:
+            try:
+                p.kill()
+            except psutil.NoSuchProcess:
+                pass
+    return len(killed)
 
 BacktestModel = Literal["every_tick", "1m_ohlc", "open_prices", "every_tick_real"]
 
@@ -79,6 +112,17 @@ def run_backtest(cfg: BacktestConfig) -> dict:
         stale = reports_dir / f"{cfg.expert_name}_report{ext}"
         if stale.exists():
             stale.unlink()
+
+    # Stop any existing terminal that holds the data-folder lock. This is
+    # essential when the MCP transport is used : mt5.initialize() bridges
+    # the Python API by spawning a terminal that stays alive, and that
+    # terminal's lock will silently break our /config: launch.
+    try:
+        import MetaTrader5 as mt5  # type: ignore
+        mt5.shutdown()
+    except Exception:
+        pass
+    _stop_running_terminals(config.terminal_path)
 
     # Run terminal in tester mode.
     # NOTE: We deliberately omit /portable because /portable redirects MT5 to
