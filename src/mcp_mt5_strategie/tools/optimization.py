@@ -1,12 +1,22 @@
 """
-Optimization — wraps MT5's native genetic/brute-force optimizer.
+Optimization — grid search over EA parameters with optional walk-forward.
 
-Allows running an EA across a grid of parameters and ranking results
-by a chosen criterion (profit, Sharpe, custom).
+DESIGN NOTE — why we don't use MT5's native optimizer
+-----------------------------------------------------
+MT5's native Strategy Tester optimization runs 16-core in parallel and is very
+fast, but it writes results only to an undocumented binary cache file
+(``Tester/cache/*.opt``) — not to XML or HTML. The .opt format has changed
+between builds (5660 → 5833) and reverse-engineering it is fragile.
 
-THIS IS NEW — not in Qoyyuum's base server.
+Instead we loop ``run_backtest`` in Python : slower (one core, no parallelism)
+but every pass writes a parseable HTML report and we already validated that
+end-to-end. Trade-off : ~25s × N combinations vs ~5min/100 native.
+
+The native helpers (``_generate_optimizer_ini``, ``OPT_*_CODES``) are kept
+for advanced users who want to drive MT5 manually and read the .opt cache
+themselves.
 """
-import subprocess
+import itertools
 import time
 from datetime import datetime
 from pathlib import Path
@@ -15,8 +25,7 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 
 from ..config import config
-from ..parsers.opt_xml import parse_optimization_report
-from .backtest import BacktestConfig, MODEL_CODES, _find_latest_report, _stop_running_terminals
+from .backtest import BacktestConfig, MODEL_CODES, run_backtest
 
 OptCriterion = Literal[
     "balance_max",
@@ -39,13 +48,24 @@ OPT_CRITERION_CODES = {
 
 OptAlgorithm = Literal["complete", "genetic"]
 OPT_ALGO_CODES = {
-    "complete": 1,  # brute-force on all combinations
-    "genetic": 2,   # MT5 genetic algorithm
+    "complete": 1,
+    "genetic": 2,
+}
+
+# Map our optimization criterion → stat key produced by the HTML parser.
+_CRITERION_TO_STAT = {
+    "balance_max": ("net_profit", True),         # True = higher is better
+    "profit_factor_max": ("profit_factor", True),
+    "expected_payoff_max": ("expected_payoff", True),
+    "drawdown_min": ("max_drawdown", False),     # False = lower is better
+    "recovery_factor_max": ("recovery_factor", True),
+    "sharpe_ratio_max": ("sharpe_ratio", True),
+    "custom": ("net_profit", True),
 }
 
 
 class ParamRange(BaseModel):
-    """Parameter optimization range."""
+    """Parameter optimization range (inclusive both ends)."""
     start: float
     step: float
     stop: float
@@ -58,134 +78,270 @@ class OptimizationConfig(BaseModel):
     expert_name: str
     from_date: str
     to_date: str
-    model: str = "1m_ohlc"  # default for opt = faster
+    model: str = "1m_ohlc"  # faster model = better for grid search
     deposit: float = 100_000.0
     leverage: int = 100
     currency: str = "USD"
 
-    # Optimization-specific
     criterion: OptCriterion = "sharpe_ratio_max"
-    algorithm: OptAlgorithm = "genetic"
+    algorithm: OptAlgorithm = "genetic"  # kept for API parity, ignored by loop
 
-    # Parameters to optimize : {name: ParamRange or fixed_value}
+    # {name: ParamRange dict or fixed value}
     inputs: dict[str, Any] = Field(default_factory=dict)
-    # For each input, if dict has {start, step, stop} → optimized, else fixed
 
-    # Forward test split
+    # Walk-forward split
     forward_mode: Literal["none", "half", "third", "quarter", "custom"] = "none"
-    forward_date: Optional[str] = None  # required if forward_mode=custom
+    forward_date: Optional[str] = None
 
+    # Overall budget for the whole optimization (not per-backtest)
     timeout_sec: Optional[int] = None
 
 
+# ============================================================
+# Public entry point
+# ============================================================
+
 def run_optimization(cfg: OptimizationConfig) -> dict:
-    """Run a parameter optimization in MT5 Strategy Tester.
+    """Grid-search optimization with optional walk-forward validation.
+
+    For each parameter combination, runs a full backtest via ``run_backtest``
+    (HTML report → parsed stats). Aggregates results, picks the best by the
+    chosen criterion, and if ``forward_mode`` ≠ ``none`` re-runs the best
+    params on the out-of-sample window to detect overfitting.
 
     Returns:
         {
             success: bool,
-            passes: int,             # number of param combinations tested
-            best_params: dict,
-            best_stats: dict,
-            all_passes: [
-                {params: {...}, stats: {...}},
-                ...
-            ],
+            passes: int,
+            best_params: dict | None,
+            best_stats: dict | None,
+            all_passes: [{params, stats, success}, ...],
+            train_window: (str, str),
+            forward_window: (str, str) | None,
+            forward_stats: dict | None,
+            walk_forward_dropoff_pct: float | None,  # negative = worse OOS
+            elapsed_sec: float,
             error: str | None,
         }
     """
     if cfg.timeout_sec is None:
         cfg.timeout_sec = config.optimization_timeout_sec
-
-    ini_path = _generate_optimizer_ini(cfg)
-
-    reports_dir = config.reports_dir() / "Reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
-
-    # Clear old optimization report
-    expected = reports_dir / f"{cfg.expert_name}_opt.xml"
-    if expected.exists():
-        expected.unlink()
-
-    # Stop the bridge-terminal MT5 Python API may have launched (see backtest.py)
-    try:
-        import MetaTrader5 as mt5  # type: ignore
-        mt5.shutdown()
-    except Exception:
-        pass
-    _stop_running_terminals(config.terminal_path)
-
-    # See note in backtest.py — /portable would point MT5 at the install dir,
-    # not the AppData instance where the EA lives.
-    cmd = [str(config.terminal_path), f"/config:{ini_path}"]
     start = time.time()
-    try:
-        subprocess.run(cmd, timeout=cfg.timeout_sec, capture_output=True)
-    except subprocess.TimeoutExpired:
-        return {
-            "success": False,
-            "error": f"Optimization timeout ({cfg.timeout_sec}s)",
-            "passes": 0,
-            "best_params": None,
-            "best_stats": None,
-            "all_passes": [],
-        }
 
-    # Same as backtest : if MT5 is already running, subprocess returns instantly
-    # while the actual test runs in the background. Poll for the report file.
-    def _find_opt(name: str):
-        r = _find_latest_report(reports_dir, f"{name}_opt")
-        if r is None:
-            r = _find_latest_report(reports_dir, name)
-        return r
+    train_window, forward_window = _split_walk_forward(cfg)
+    ranges, fixed = _split_inputs(cfg.inputs)
 
-    report = _find_opt(cfg.expert_name)
-    if report is None:
-        deadline = start + cfg.timeout_sec
-        while time.time() < deadline:
-            time.sleep(5)
-            report = _find_opt(cfg.expert_name)
-            if report is not None:
-                time.sleep(2)  # let MT5 finish writing
-                report = _find_opt(cfg.expert_name)
-                break
+    if not ranges:
+        return _err("No optimization ranges provided (all params fixed)", start)
 
-    if report is None:
-        return {
-            "success": False,
-            "error": "No optimization report generated",
-            "passes": 0,
-            "best_params": None,
-            "best_stats": None,
-            "all_passes": [],
-        }
+    # Build combinations as ordered list of (param_name → value) dicts
+    keys = list(ranges.keys())
+    value_lists = [ranges[k] for k in keys]
+    combinations = list(itertools.product(*value_lists))
 
-    parsed = parse_optimization_report(report)
-    # Find best by criterion
-    best = _find_best(parsed["passes"], cfg.criterion)
+    # Run each combination on the training window
+    all_passes: list[dict] = []
+    for combo in combinations:
+        if time.time() - start > cfg.timeout_sec:
+            return _err(
+                f"Optimization timeout — completed {len(all_passes)}/"
+                f"{len(combinations)} passes",
+                start,
+                all_passes,
+            )
+        params = {**fixed, **dict(zip(keys, combo))}
+        bt_cfg = BacktestConfig(
+            symbol=cfg.symbol,
+            timeframe=cfg.timeframe,
+            expert_name=cfg.expert_name,
+            from_date=train_window[0],
+            to_date=train_window[1],
+            model=cfg.model,
+            deposit=cfg.deposit,
+            leverage=cfg.leverage,
+            currency=cfg.currency,
+            inputs=params,
+            visual=False,
+        )
+        try:
+            result = run_backtest(bt_cfg)
+        except Exception as e:  # noqa: BLE001
+            all_passes.append({
+                "params": params,
+                "stats": {},
+                "success": False,
+                "error": f"{type(e).__name__}: {e}",
+            })
+            continue
+        all_passes.append({
+            "params": params,
+            "stats": result.get("stats") or {},
+            "success": bool(result.get("success")),
+        })
+
+    # Pick best on training window
+    best = _find_best(all_passes, cfg.criterion)
+
+    # Walk-forward validation
+    forward_stats: Optional[dict] = None
+    dropoff: Optional[float] = None
+    if forward_window is not None and best is not None:
+        fwd_cfg = BacktestConfig(
+            symbol=cfg.symbol,
+            timeframe=cfg.timeframe,
+            expert_name=cfg.expert_name,
+            from_date=forward_window[0],
+            to_date=forward_window[1],
+            model=cfg.model,
+            deposit=cfg.deposit,
+            leverage=cfg.leverage,
+            currency=cfg.currency,
+            inputs=best["params"],
+            visual=False,
+        )
+        fwd_result = run_backtest(fwd_cfg)
+        forward_stats = fwd_result.get("stats") or {}
+        crit_key, _higher_better = _CRITERION_TO_STAT.get(
+            cfg.criterion, ("net_profit", True)
+        )
+        train_v = best["stats"].get(crit_key)
+        fwd_v = forward_stats.get(crit_key)
+        if isinstance(train_v, (int, float)) and isinstance(fwd_v, (int, float)) and train_v:
+            dropoff = (fwd_v - train_v) / abs(train_v) * 100.0
+
     return {
         "success": True,
-        "passes": len(parsed["passes"]),
-        "best_params": best.get("params") if best else None,
-        "best_stats": best.get("stats") if best else None,
-        "all_passes": parsed["passes"],
-        "report_path": str(report),
+        "passes": len(all_passes),
+        "best_params": best["params"] if best else None,
+        "best_stats": best["stats"] if best else None,
+        "all_passes": all_passes,
+        "train_window": list(train_window),
+        "forward_window": list(forward_window) if forward_window else None,
+        "forward_stats": forward_stats,
+        "walk_forward_dropoff_pct": dropoff,
+        "elapsed_sec": time.time() - start,
+        "error": None,
+    }
+
+
+# ============================================================
+# Helpers : input splitting, walk-forward, best selection
+# ============================================================
+
+def _split_inputs(inputs: dict[str, Any]) -> tuple[dict[str, list[float]], dict[str, Any]]:
+    """Separate range-typed inputs from fixed-value inputs.
+
+    Range dicts have at least ``start`` and ``stop``; everything else is fixed.
+    Returns ``(ranges: {name: [values]}, fixed: {name: value})``.
+    """
+    ranges: dict[str, list[float]] = {}
+    fixed: dict[str, Any] = {}
+    for name, val in inputs.items():
+        if isinstance(val, dict) and "start" in val and "stop" in val:
+            r = ParamRange(**val)
+            values = _range_values(r)
+            ranges[name] = values
+        else:
+            fixed[name] = val
+    return ranges, fixed
+
+
+def _range_values(r: ParamRange) -> list[float]:
+    """Inclusive range expansion. Handles float step error gracefully."""
+    if r.step <= 0:
+        return [r.start]
+    out: list[float] = []
+    v = r.start
+    # Tolerance so 0.5 + 0.4 + 0.4 → includes 1.3 not just 0.9
+    while v <= r.stop + r.step * 1e-9:
+        # Round if step is integer-like
+        if r.step == int(r.step) and r.start == int(r.start):
+            out.append(int(round(v)))
+        else:
+            out.append(round(v, 8))
+        v += r.step
+    return out
+
+
+def _split_walk_forward(
+    cfg: OptimizationConfig,
+) -> tuple[tuple[str, str], Optional[tuple[str, str]]]:
+    """Compute (train_window, forward_window) from cfg.forward_mode."""
+    start = datetime.fromisoformat(cfg.from_date)
+    end = datetime.fromisoformat(cfg.to_date)
+    span = end - start
+    fmt = "%Y-%m-%d"
+
+    if cfg.forward_mode == "none":
+        return (cfg.from_date, cfg.to_date), None
+
+    if cfg.forward_mode == "half":
+        split = start + span / 2
+    elif cfg.forward_mode == "third":
+        split = start + span / 3
+    elif cfg.forward_mode == "quarter":
+        split = start + span / 4
+    elif cfg.forward_mode == "custom":
+        if not cfg.forward_date:
+            raise ValueError("forward_date required when forward_mode='custom'")
+        split = datetime.fromisoformat(cfg.forward_date)
+    else:
+        return (cfg.from_date, cfg.to_date), None
+
+    train = (cfg.from_date, split.strftime(fmt))
+    forward = (split.strftime(fmt), cfg.to_date)
+    return train, forward
+
+
+def _find_best(passes: list[dict], criterion: OptCriterion) -> Optional[dict]:
+    """Pick the pass with the best stat for the given criterion."""
+    if not passes:
+        return None
+    key, higher_better = _CRITERION_TO_STAT.get(criterion, ("net_profit", True))
+    valid = [
+        p for p in passes
+        if isinstance(p.get("stats", {}).get(key), (int, float))
+    ]
+    if not valid:
+        return None
+    return sorted(valid, key=lambda p: p["stats"][key], reverse=higher_better)[0]
+
+
+def _err(msg: str, start: float, all_passes: Optional[list] = None) -> dict:
+    return {
+        "success": False,
+        "error": msg,
+        "passes": len(all_passes) if all_passes else 0,
+        "best_params": None,
+        "best_stats": None,
+        "all_passes": all_passes or [],
+        "train_window": None,
+        "forward_window": None,
+        "forward_stats": None,
+        "walk_forward_dropoff_pct": None,
         "elapsed_sec": time.time() - start,
     }
 
 
+# ============================================================
+# Native MT5 optimizer helpers — kept for advanced users
+# ============================================================
+
 def _generate_optimizer_ini(cfg: OptimizationConfig) -> Path:
-    """Generate the tester.ini for optimization mode."""
+    """Build a tester.ini for MT5's native optimizer.
+
+    Kept for users who want to invoke MT5 directly and parse the .opt cache
+    themselves. run_optimization() above does NOT use this — it loops
+    run_backtest in Python.
+    """
     tester_dir = config.reports_dir()
     tester_dir.mkdir(parents=True, exist_ok=True)
     ini_path = tester_dir / f"opt_{cfg.expert_name}_{int(time.time())}.ini"
 
     from_date = datetime.fromisoformat(cfg.from_date).strftime("%Y.%m.%d")
     to_date = datetime.fromisoformat(cfg.to_date).strftime("%Y.%m.%d")
-
     fwd_codes = {"none": 0, "half": 1, "third": 2, "quarter": 4, "custom": 3}
 
-    # Expert= is relative to MQL5/Experts/ — no "Experts\" prefix (see backtest.py)
     tester = (
         f"Expert={cfg.expert_name}.ex5\n"
         f"Symbol={cfg.symbol}\n"
@@ -210,10 +366,6 @@ def _generate_optimizer_ini(cfg: OptimizationConfig) -> Path:
         f"Report={cfg.expert_name}_opt\n"
         f"ReplaceReport=1\n"
     )
-
-    # TesterInputs section : encode ranges as MT5 expects
-    # Format : InputName=start||start||step||stop||Y
-    # Y at end = 1 to include in optimization, 0 to fix at value
     inputs_section = "[TesterInputs]\n"
     for name, val in cfg.inputs.items():
         if isinstance(val, dict) and "start" in val and "stop" in val:
@@ -225,23 +377,3 @@ def _generate_optimizer_ini(cfg: OptimizationConfig) -> Path:
     content = f"[Tester]\n{tester}\n{inputs_section}"
     ini_path.write_text(content, encoding="utf-16-le")
     return ini_path
-
-
-def _find_best(passes: list[dict], criterion: OptCriterion) -> Optional[dict]:
-    """Find the best pass based on criterion."""
-    if not passes:
-        return None
-    key_map = {
-        "balance_max": ("profit", True),
-        "profit_factor_max": ("profit_factor", True),
-        "expected_payoff_max": ("expected_payoff", True),
-        "drawdown_min": ("max_drawdown", False),
-        "recovery_factor_max": ("recovery_factor", True),
-        "sharpe_ratio_max": ("sharpe_ratio", True),
-        "custom": ("custom_criterion", True),
-    }
-    key, reverse = key_map.get(criterion, ("profit", True))
-    valid = [p for p in passes if key in p.get("stats", {})]
-    if not valid:
-        return None
-    return sorted(valid, key=lambda p: p["stats"][key], reverse=reverse)[0]
