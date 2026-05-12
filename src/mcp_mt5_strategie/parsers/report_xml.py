@@ -43,6 +43,8 @@ from typing import Any
 
 from lxml import etree
 
+from ._io import load_xml_root
+
 
 def parse_backtest_report(path: Path | str) -> dict[str, Any]:
     """Parse a single backtest report.
@@ -69,24 +71,15 @@ def parse_backtest_report(path: Path | str) -> dict[str, Any]:
 
 
 def _parse_xml(path: Path) -> dict[str, Any]:
-    """Parse a clean XML report."""
-    parser = etree.XMLParser(recover=True, encoding="utf-16")
-    try:
-        tree = etree.parse(str(path), parser)
-    except Exception:
-        # Try without explicit encoding
-        parser = etree.XMLParser(recover=True)
-        tree = etree.parse(str(path), parser)
-
-    root = tree.getroot()
-    result = {
+    """Parse a clean XML report. Raises XMLSyntaxError on HTML/bad content."""
+    root = load_xml_root(path)
+    return {
         "header": _extract_header(root),
         "inputs": _extract_inputs(root),
         "stats": _extract_stats(root),
         "trades": _extract_trades(root),
         "equity_curve": _extract_equity(root),
     }
-    return result
 
 
 def _parse_html(path: Path) -> dict[str, Any]:

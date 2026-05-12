@@ -26,6 +26,7 @@ from pathlib import Path
 
 from lxml import etree
 
+from ._io import load_xml_root
 from .report_xml import _extract_inputs, _extract_stats
 
 
@@ -46,14 +47,13 @@ def parse_optimization_report(path: Path | str) -> dict:
     if not path.exists():
         return {"error": f"Report not found: {path}", "passes": []}
 
-    parser = etree.XMLParser(recover=True, encoding="utf-16")
     try:
-        tree = etree.parse(str(path), parser)
-    except Exception:
-        parser = etree.XMLParser(recover=True)
-        tree = etree.parse(str(path), parser)
+        root = load_xml_root(path)
+    except etree.XMLSyntaxError:
+        # Probably HTML — fall back below
+        passes = _parse_html_optimization(path)
+        return {"passes": passes, "total_passes": len(passes)}
 
-    root = tree.getroot()
     passes = []
 
     # XML <Pass> elements
