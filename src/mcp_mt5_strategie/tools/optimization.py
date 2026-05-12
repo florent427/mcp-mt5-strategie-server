@@ -123,10 +123,24 @@ def run_optimization(cfg: OptimizationConfig) -> dict:
             "all_passes": [],
         }
 
-    # Find generated report
-    report = _find_latest_report(reports_dir, f"{cfg.expert_name}_opt")
+    # Same as backtest : if MT5 is already running, subprocess returns instantly
+    # while the actual test runs in the background. Poll for the report file.
+    def _find_opt(name: str):
+        r = _find_latest_report(reports_dir, f"{name}_opt")
+        if r is None:
+            r = _find_latest_report(reports_dir, name)
+        return r
+
+    report = _find_opt(cfg.expert_name)
     if report is None:
-        report = _find_latest_report(reports_dir, cfg.expert_name)
+        deadline = start + cfg.timeout_sec
+        while time.time() < deadline:
+            time.sleep(5)
+            report = _find_opt(cfg.expert_name)
+            if report is not None:
+                time.sleep(2)  # let MT5 finish writing
+                report = _find_opt(cfg.expert_name)
+                break
 
     if report is None:
         return {

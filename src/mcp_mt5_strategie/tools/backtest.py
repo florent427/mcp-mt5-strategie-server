@@ -109,10 +109,24 @@ def run_backtest(cfg: BacktestConfig) -> dict:
             "elapsed_sec": time.time() - start,
         }
 
-    elapsed = time.time() - start
-
-    # Find the generated report (XML preferred)
+    # subprocess.run normally blocks until terminal64 exits, but if an MT5
+    # terminal has already been launched in this session, Windows re-routes
+    # the new launch to the existing terminal and our subprocess returns in
+    # well under a second while the actual test runs in the background.
+    # Poll for the report file to detect real completion.
     report_path = _find_latest_report(reports_dir, cfg.expert_name)
+    if report_path is None:
+        deadline = start + cfg.timeout_sec
+        while time.time() < deadline:
+            time.sleep(2)
+            report_path = _find_latest_report(reports_dir, cfg.expert_name)
+            if report_path is not None:
+                # Report appeared — give MT5 a moment to finish writing it
+                time.sleep(1)
+                report_path = _find_latest_report(reports_dir, cfg.expert_name)
+                break
+
+    elapsed = time.time() - start
     if report_path is None:
         return {
             "success": False,
