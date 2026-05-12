@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+*.cover
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# MT5 build artifacts
+*.ex5
+*.ex4
+*.log
+
+# Generated tester configs / reports
+*tester*.ini
+backtest_*.ini
+opt_*.ini
+*_report.xml
+*_report.html
+*_opt.xml
+*_opt.html
+
+# Secrets
+.env
+.env.local
+*.key
+credentials.json
+
+# OS
+Thumbs.db
+desktop.ini

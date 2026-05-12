@@ -1,0 +1,59 @@
+[project]
+name = "mcp-mt5-strategie-server"
+version = "0.1.0"
+description = "MCP server for MetaTrader 5 — full coverage including MQL5 development, backtest, and optimization"
+authors = [
+    {name = "Florent Morel", email = "florent.morel427@gmail.com"},
+]
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+keywords = ["mcp", "metatrader", "mt5", "mql5", "trading", "backtest", "optimization"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "fastmcp>=0.4.0",
+    "MetaTrader5>=5.0.45",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "lxml>=5.0.0",       # XML parsing for backtest reports
+    "beautifulsoup4>=4.12.0",  # HTML parsing for reports
+    "pydantic>=2.0.0",
+    "psutil>=5.9.0",     # Process management for MT5 terminal
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "ruff>=0.1.0",
+    "mypy>=1.5.0",
+]
+
+[project.scripts]
+mt5-strategie-mcp = "mcp_mt5_strategie.server:main"
+
+[project.urls]
+Homepage = "https://github.com/florentmorel/mcp-mt5-strategie-server"
+Issues = "https://github.com/florentmorel/mcp-mt5-strategie-server/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_mt5_strategie"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
