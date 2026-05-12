@@ -83,25 +83,34 @@ def _parse_xml(path: Path) -> dict[str, Any]:
 
 
 def _parse_html(path: Path) -> dict[str, Any]:
-    """Parse an HTML report (fallback)."""
+    """Parse an HTML report — MT5 writes these as UTF-16-LE with BOM."""
     from bs4 import BeautifulSoup
 
-    raw = path.read_text(encoding="utf-16", errors="replace")
-    if "<html" not in raw.lower():
-        raw = path.read_text(encoding="utf-8", errors="replace")
+    data = path.read_bytes()
+    if data.startswith(b"\xff\xfe"):
+        raw = data[2:].decode("utf-16-le", errors="replace")
+    elif data.startswith(b"\xfe\xff"):
+        raw = data[2:].decode("utf-16-be", errors="replace")
+    elif data.startswith(b"\xef\xbb\xbf"):
+        raw = data[3:].decode("utf-8", errors="replace")
+    else:
+        try:
+            raw = data.decode("utf-16-le")
+            if "<html" not in raw.lower():
+                raise UnicodeDecodeError("utf-16-le", b"", 0, 0, "no html tag")
+        except (UnicodeDecodeError, LookupError):
+            raw = data.decode("utf-8", errors="replace")
 
     soup = BeautifulSoup(raw, "html.parser")
 
-    # MT5 HTML reports have tables for stats and trades.
-    # Stats table is typically the first one.
-    result = {
-        "header": {},
-        "inputs": {},
+    header, inputs = _extract_html_header_inputs(soup)
+    return {
+        "header": header,
+        "inputs": inputs,
         "stats": _extract_html_stats(soup),
         "trades": _extract_html_trades(soup),
         "equity_curve": [],  # rarely in HTML
     }
-    return result
 
 
 # ============================================================
@@ -204,36 +213,162 @@ def _extract_equity(root) -> list[dict]:
 # HTML extractors (fallback)
 # ============================================================
 
+# Stat labels in English + French (MT5's locale follows the broker's server).
+# Each entry maps a normalized (lowercase, no trailing colon, no accents-loss)
+# label to our canonical key. Values are extracted from MT5's table rows
+# which interleave label and value cells: [label1, val1, label2, val2, ...].
+_HTML_STAT_LABELS = {
+    # net profit
+    "total net profit": "net_profit",
+    "profit total net": "net_profit",
+    # gross
+    "gross profit": "gross_profit",
+    "profit brut": "gross_profit",
+    "gross loss": "gross_loss",
+    "perte brut": "gross_loss",
+    "perte brute": "gross_loss",
+    # profit factor
+    "profit factor": "profit_factor",
+    "facteur de profit": "profit_factor",
+    # expected payoff
+    "expected payoff": "expected_payoff",
+    "remboursement attendu": "expected_payoff",
+    # recovery factor
+    "recovery factor": "recovery_factor",
+    "facteur de recuperation": "recovery_factor",
+    # sharpe
+    "sharpe ratio": "sharpe_ratio",
+    "ratio de sharpe": "sharpe_ratio",
+    # drawdown
+    "balance drawdown maximal": "max_drawdown",
+    "solde drawdown maximal": "max_drawdown",
+    "balance drawdown absolute": "absolute_drawdown",
+    "solde drawdown absolu": "absolute_drawdown",
+    # trades count
+    "total trades": "trades",
+    "nb trades": "trades",
+    "total deals": "total_deals",
+    "operations au total": "total_deals",
+    # winners / losers
+    "profit trades": "win_trades",
+    "loss trades": "loss_trades",
+    # extremes
+    "largest profit trade": "largest_win",
+    "plus large position gagnante": "largest_win",
+    "largest loss trade": "largest_loss",
+    "plus large position perdante": "largest_loss",
+    # averages
+    "average profit trade": "avg_win",
+    "moyenne position gagnante": "avg_win",
+    "average loss trade": "avg_loss",
+    "moyenne position perdante": "avg_loss",
+}
+
+
+def _strip_accents(s: str) -> str:
+    """Best-effort accent stripping so French labels match the lookup map."""
+    import unicodedata
+
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c)
+    )
+
+
+def _parse_number(raw: str) -> float | str:
+    """Parse a MT5 numeric cell.
+
+    MT5 uses non-breaking spaces as thousand separators ("1 234.56") and may
+    embed a percentage in parentheses ("1 234.56 (1.23%)"). We take the first
+    numeric token.
+    """
+    cleaned = raw.replace(" ", "").replace(" ", "").replace(",", ".")
+    # Drop trailing "(x.yz%)" or similar
+    if "(" in cleaned:
+        cleaned = cleaned.split("(", 1)[0]
+    try:
+        return float(cleaned)
+    except (ValueError, TypeError):
+        return raw
+
+
 def _extract_html_stats(soup) -> dict:
-    """Extract stats from MT5's HTML report."""
-    stats = {}
-    # MT5 HTML has rows like : <tr><td>Total Net Profit:</td><td>5234.50</td></tr>
-    label_map = {
-        "total net profit": "net_profit",
-        "gross profit": "gross_profit",
-        "gross loss": "gross_loss",
-        "profit factor": "profit_factor",
-        "expected payoff": "expected_payoff",
-        "recovery factor": "recovery_factor",
-        "sharpe ratio": "sharpe_ratio",
-        "balance drawdown maximal": "max_drawdown",
-        "balance drawdown maximal %": "max_drawdown_pct",
-        "total trades": "trades",
-        "profit trades": "win_trades",
-        "loss trades": "loss_trades",
-    }
+    """Extract stats from MT5's HTML report (locale-aware)."""
+    stats: dict = {}
     for row in soup.find_all("tr"):
-        cells = row.find_all("td")
-        if len(cells) < 2:
-            continue
-        label = cells[0].get_text(strip=True).lower().rstrip(":")
-        value = cells[1].get_text(strip=True)
-        if label in label_map:
-            try:
-                stats[label_map[label]] = float(value.replace(" ", "").replace(",", ""))
-            except ValueError:
-                stats[label_map[label]] = value
+        cells = [c.get_text(strip=True) for c in row.find_all("td")]
+        # Walk cells in (label, value) pairs — MT5 rows interleave them
+        i = 0
+        while i + 1 < len(cells):
+            label = _strip_accents(cells[i]).lower().rstrip(":").strip()
+            value = cells[i + 1]
+            if label in _HTML_STAT_LABELS and value:
+                stats[_HTML_STAT_LABELS[label]] = _parse_number(value)
+            i += 2
     return stats
+
+
+def _extract_html_header_inputs(soup) -> tuple[dict, dict]:
+    """Extract symbol/period/expert/dates header and EA inputs from MT5 HTML.
+
+    EA inputs appear under the "Placement:" / "Inputs:" label as one
+    "name=value" pair per cell.
+    """
+    header: dict[str, str] = {}
+    inputs: dict[str, float | str] = {}
+    header_label_map = {
+        "expert": "expert",
+        "symbol": "symbol",
+        "symbole": "symbol",
+        "period": "period",
+        "periode": "period",
+        "broker": "broker",
+        "courtier": "broker",
+        "currency": "currency",
+        "devise": "currency",
+        "initial deposit": "deposit",
+        "depot initial": "deposit",
+        "leverage": "leverage",
+        "levier": "leverage",
+    }
+    in_inputs = False
+    for row in soup.find_all("tr"):
+        cells = [c.get_text(strip=True) for c in row.find_all("td")]
+        if not cells:
+            continue
+        first = _strip_accents(cells[0]).lower().rstrip(":").strip()
+        if first in ("inputs", "placement"):
+            in_inputs = True
+            # Inputs may start on the same row after the label cell
+            for c in cells[1:]:
+                if "=" in c:
+                    k, v = c.split("=", 1)
+                    inputs[k.strip()] = _parse_number(v.strip())
+            continue
+        if in_inputs:
+            # We stay in input mode only for rows that look like name=value
+            # in their first non-label cell. Any row whose first cell is a
+            # known header label (Courtier:/Broker:/Devise:/...) or section
+            # header ("Resultats"/"Results") exits input mode.
+            if first in header_label_map or first in ("results", "resultats"):
+                in_inputs = False
+                # fall through to header-pair handling below
+            else:
+                # Treat as input if any cell has "=", otherwise skip
+                if any("=" in c for c in cells):
+                    for c in cells:
+                        if "=" in c:
+                            k, v = c.split("=", 1)
+                            inputs[k.strip()] = _parse_number(v.strip())
+                    continue
+                # otherwise drop through
+        # Header pairs
+        i = 0
+        while i + 1 < len(cells):
+            label = _strip_accents(cells[i]).lower().rstrip(":").strip()
+            if label in header_label_map and cells[i + 1]:
+                header[header_label_map[label]] = cells[i + 1]
+            i += 2
+    return header, inputs
 
 
 def _extract_html_trades(soup) -> list[dict]:

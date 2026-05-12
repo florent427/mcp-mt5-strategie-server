@@ -82,3 +82,40 @@ def test_parse_accepts_string_path(xml_report: Path):
     result = parse_backtest_report(str(xml_report))
     assert "stats" in result
     assert result["stats"]["net_profit"] == 5234.50
+
+
+# ============================================================
+# French-locale HTML (e.g. FTMO Global Markets server)
+# ============================================================
+
+def test_french_html_extracts_stats(french_html_report: Path):
+    """Verify the parser handles French labels + thousand-separator spaces."""
+    r = parse_backtest_report(french_html_report)
+    s = r["stats"]
+    assert s["net_profit"] == -1558.07
+    assert s["gross_profit"] == 1529.16
+    assert s["gross_loss"] == -3087.23
+    assert s["profit_factor"] == 0.50
+    assert s["expected_payoff"] == -6.28
+    assert s["sharpe_ratio"] == -5.0
+    assert s["recovery_factor"] == -0.88
+    assert s["max_drawdown"] == 1748.89  # "1 748.89 (1.75%)" → 1748.89
+    assert s["trades"] == 248
+    assert s["total_deals"] == 496
+
+
+def test_french_html_extracts_inputs(french_html_report: Path):
+    r = parse_backtest_report(french_html_report)
+    inp = r["inputs"]
+    assert inp["Lookback"] == 20.0
+    assert inp["FibLevel"] == 0.9
+    assert inp["LongOnly"] == "true"
+
+
+def test_french_html_extracts_header(french_html_report: Path):
+    r = parse_backtest_report(french_html_report)
+    h = r["header"]
+    assert h["expert"] == "fib_090_ea"
+    assert "BTCUSD" in h.get("symbol", "")
+    assert h["broker"] == "FTMO Global Markets Ltd"
+    assert h["currency"] == "USD"

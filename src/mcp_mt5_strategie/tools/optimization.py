@@ -107,7 +107,9 @@ def run_optimization(cfg: OptimizationConfig) -> dict:
     if expected.exists():
         expected.unlink()
 
-    cmd = [str(config.terminal_path), f"/config:{ini_path}", "/portable"]
+    # See note in backtest.py — /portable would point MT5 at the install dir,
+    # not the AppData instance where the EA lives.
+    cmd = [str(config.terminal_path), f"/config:{ini_path}"]
     start = time.time()
     try:
         subprocess.run(cmd, timeout=cfg.timeout_sec, capture_output=True)
@@ -161,8 +163,9 @@ def _generate_optimizer_ini(cfg: OptimizationConfig) -> Path:
 
     fwd_codes = {"none": 0, "half": 1, "third": 2, "quarter": 4, "custom": 3}
 
+    # Expert= is relative to MQL5/Experts/ — no "Experts\" prefix (see backtest.py)
     tester = (
-        f"Expert=Experts\\{cfg.expert_name}\n"
+        f"Expert={cfg.expert_name}.ex5\n"
         f"Symbol={cfg.symbol}\n"
         f"Period={cfg.timeframe.upper()}\n"
         f"Optimization={OPT_ALGO_CODES[cfg.algorithm]}\n"

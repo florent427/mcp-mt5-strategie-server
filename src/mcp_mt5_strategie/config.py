@@ -35,17 +35,42 @@ class MT5Config(BaseModel):
     optimization_timeout_sec: int = 7200  # 2h pour optimisation
 
     def resolve_mql5_dir(self) -> Path:
-        """Trouve le dossier MQL5 sous data_path/<instance_id>/MQL5."""
+        """Find the MQL5 data folder that matches our terminal_path.
+
+        Each MT5 install gets its own AppData/Roaming/MetaQuotes/Terminal/<hash>
+        folder, identified by an origin.txt that contains the install dir path.
+        Picking the wrong instance silently — as the previous "first match"
+        heuristic did — means the EA is written to one folder but
+        terminal64.exe runs from another, and no backtest ever fires.
+        """
         if self.mql5_dir is not None and self.mql5_dir.exists():
             return self.mql5_dir
         if not self.data_path.exists():
             raise FileNotFoundError(f"MT5 data path not found: {self.data_path}")
-        # data_path contient des sous-dossiers nommés par hash de terminal
+
+        install_dir = str(self.terminal_path.parent).lower()
+        fallback: Optional[Path] = None
         for sub in self.data_path.iterdir():
             mql5 = sub / "MQL5"
-            if mql5.is_dir():
-                self.mql5_dir = mql5
-                return mql5
+            if not mql5.is_dir():
+                continue
+            # MT5 writes origin.txt as UTF-16 LE with BOM
+            origin = sub / "origin.txt"
+            if origin.exists():
+                try:
+                    raw = origin.read_text(encoding="utf-16-le").strip().lstrip("﻿")
+                except UnicodeDecodeError:
+                    raw = origin.read_text(encoding="utf-8", errors="replace").strip()
+                if raw.lower().startswith(install_dir):
+                    self.mql5_dir = mql5
+                    return mql5
+            # Remember first viable folder in case nothing matches
+            if fallback is None:
+                fallback = mql5
+
+        if fallback is not None:
+            self.mql5_dir = fallback
+            return fallback
         raise FileNotFoundError(f"No MQL5 directory found under {self.data_path}")
 
     def experts_dir(self) -> Path:

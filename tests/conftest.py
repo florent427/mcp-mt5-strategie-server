@@ -164,3 +164,41 @@ def html_report(tmp_path: Path) -> Path:
 @pytest.fixture
 def missing_report(tmp_path: Path) -> Path:
     return tmp_path / "does_not_exist.xml"
+
+
+# MT5 actually writes its HTML reports as UTF-16-LE with BOM and the labels
+# are localized per the broker's server. This fixture mirrors the real format
+# seen with FTMO (French locale) — multi-cell rows, accented labels,
+# non-breaking-space thousand separators, "value (pct%)" inside cells.
+FRENCH_HTML_SAMPLE = """<html>
+<body>
+<table>
+<tr><td>Rapport du Testeur de Strategie</td></tr>
+<tr><td>FTMO-Server4 (Build 5833)</td></tr>
+<tr><td>Reglages</td></tr>
+<tr><td>Expert:</td><td>fib_090_ea</td></tr>
+<tr><td>Symbole:</td><td>BTCUSD</td></tr>
+<tr><td>Periode:</td><td>M5 (2025.01.02 - 2025.01.09)</td></tr>
+<tr><td>Placement:</td><td>Lookback=20</td></tr>
+<tr><td>FibLevel=0.9</td></tr>
+<tr><td>LongOnly=true</td></tr>
+<tr><td>Courtier:</td><td>FTMO Global Markets Ltd</td></tr>
+<tr><td>Devise:</td><td>USD</td></tr>
+<tr><td>Depot initial:</td><td>100 000.00</td></tr>
+<tr><td>Resultats</td></tr>
+<tr><td>Profit Total Net:</td><td>-1 558.07</td><td>Solde Drawdown Maximal:</td><td>1 748.89 (1.75%)</td></tr>
+<tr><td>Profit brut:</td><td>1 529.16</td><td>Perte brut:</td><td>-3 087.23</td></tr>
+<tr><td>Facteur de profit:</td><td>0.50</td><td>Remboursement attendu:</td><td>-6.28</td></tr>
+<tr><td>Facteur de recuperation:</td><td>-0.88</td><td>Ratio de Sharpe:</td><td>-5.00</td></tr>
+<tr><td>Nb trades:</td><td>248</td><td>Operations au Total:</td><td>496</td></tr>
+</table>
+</body>
+</html>
+"""
+
+
+@pytest.fixture
+def french_html_report(tmp_path: Path) -> Path:
+    p = tmp_path / "fib_090_ea_report.htm"
+    p.write_bytes(b"\xff\xfe" + FRENCH_HTML_SAMPLE.encode("utf-16-le"))
+    return p

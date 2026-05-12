@@ -70,19 +70,25 @@ def run_backtest(cfg: BacktestConfig) -> dict:
     # Generate tester.ini
     ini_path = _generate_tester_ini(cfg)
 
-    # Reports go to <terminal_data>/Tester/Reports
-    reports_dir = config.reports_dir() / "Reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    # Clear old report
-    expected_report = reports_dir / f"{cfg.expert_name}_report.xml"
-    if expected_report.exists():
-        expected_report.unlink()
+    # MT5 puts the report directly under the terminal data folder root
+    # (not under Tester/Reports as one might expect). With Report=NAME in the
+    # ini, the produced files are <data>/NAME.htm + <data>/NAME-*.png charts.
+    reports_dir = config.resolve_mql5_dir().parent
+    # Clear old reports to avoid mistaking a stale one for the new run
+    for ext in (".htm", ".html", ".xml"):
+        stale = reports_dir / f"{cfg.expert_name}_report{ext}"
+        if stale.exists():
+            stale.unlink()
 
-    # Run terminal in tester mode
+    # Run terminal in tester mode.
+    # NOTE: We deliberately omit /portable because /portable redirects MT5 to
+    # use the install folder as the data dir, which won't contain the EA we
+    # just compiled into the AppData instance. Without /portable, terminal64
+    # uses the same data folder (AppData/Roaming/MetaQuotes/Terminal/<hash>)
+    # where we wrote and compiled the EA.
     cmd = [
         str(config.terminal_path),
         f"/config:{ini_path}",
-        "/portable",
     ]
     start = time.time()
     try:
@@ -145,8 +151,11 @@ def _generate_tester_ini(cfg: BacktestConfig) -> Path:
     to_date = datetime.fromisoformat(cfg.to_date).strftime("%Y.%m.%d")
 
     # Section [Tester]
+    # NOTE: The Expert= field is interpreted RELATIVE to MQL5/Experts/, so do
+    # NOT prefix with "Experts\". Adding it produces "Experts\Experts\X.ex5
+    # not found" in the tester log (silent failure — terminal exits clean).
     tester_section = (
-        f"Expert=Experts\\{cfg.expert_name}\n"
+        f"Expert={cfg.expert_name}.ex5\n"
         f"Symbol={cfg.symbol}\n"
         f"Period={cfg.timeframe.upper()}\n"
         f"Optimization=0\n"
@@ -178,10 +187,20 @@ def _generate_tester_ini(cfg: BacktestConfig) -> Path:
 
 
 def _find_latest_report(reports_dir: Path, expert_name: str) -> Optional[Path]:
-    """Find the most recent report file for the given EA."""
-    # Try XML first (more parseable), then HTML
+    """Find the most recent report file for the given EA.
+
+    Searches both <reports_dir>/ (MT5's default location for Report=NAME) and
+    <reports_dir>/Reports/ (older builds + manual configurations).
+    """
+    search_dirs = [reports_dir, reports_dir / "Reports"]
     for ext in (".xml", ".html", ".htm"):
-        candidates = list(reports_dir.glob(f"{expert_name}*{ext}"))
+        candidates: list[Path] = []
+        for d in search_dirs:
+            if d.exists():
+                # Match both NAME_report.ext and NAME-something.ext but skip
+                # the chart PNGs and the auxiliary -holding/-hst/-mfemae files.
+                for f in d.glob(f"{expert_name}_report{ext}"):
+                    candidates.append(f)
         if candidates:
             return max(candidates, key=lambda p: p.stat().st_mtime)
     return None
